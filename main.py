@@ -1,14 +1,21 @@
-from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional, Dict, Any, List
 import os
+import logging
+from contextlib import asynccontextmanager
+
+# Import our PDF ingestion service
+from ingest_pdf import init_pdf_service, pdf_service
+
+# Original imports for the agent system
+from dotenv import load_dotenv
 from langgraph.graph import StateGraph, END
-from typing import TypedDict, Annotated, Sequence, Optional, Dict, Any
+from typing import TypedDict, Annotated, Sequence
 from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage, ToolMessage
 from operator import add as add_messages
 from langchain_openai import ChatOpenAI
-from langchain_openai import OpenAIEmbeddings
-from langchain_community.document_loaders import PyPDFLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_chroma import Chroma
 from langchain_core.tools import tool
 from langchain_community.utilities import GoogleSerperAPIWrapper
 import re
@@ -17,18 +24,50 @@ from datetime import datetime
 
 load_dotenv()
 
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Pydantic models for API requests/responses
+class QuestionRequest(BaseModel):
+    question: str
+    session_id: Optional[str] = None
+
+class QuestionResponse(BaseModel):
+    response: str
+    type: str
+    session_id: str
+    search_strategy: Optional[str] = None
+    reasoning: Optional[str] = None
+    confidence: Optional[float] = None
+
+class SessionResponse(BaseModel):
+    session_id: str
+    message: str
+
+class ErrorResponse(BaseModel):
+    error: str
+    session_id: Optional[str] = None
+
+class IngestionResponse(BaseModel):
+    status: str
+    message: str
+    pdf_files: Optional[int] = None
+    total_pages: Optional[int] = None
+    total_chunks: Optional[int] = None
+
 # Enhanced State for Multi-Agent System
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
     session_id: Optional[str]
     user_query: str
     clarification_needed: bool
-    search_strategy: str  # "pdf", "web", "both", "clarify"
+    search_strategy: str
     confidence_score: float
     agent_reasoning: str
     final_response: str
 
-# Session Management for RESTful API support
+# Session Management
 class SessionManager:
     def __init__(self):
         self.sessions: Dict[str, Dict[str, Any]] = {}
@@ -54,127 +93,19 @@ class SessionManager:
         if session_id in self.sessions:
             self.sessions[session_id]["messages"] = []
 
-# Load and process PDFs (keeping your existing logic)
+# Initialize LLM
 llm = ChatOpenAI(model="gpt-4o", temperature=0)
-embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
 
-papers_folder = "papers"
+# Global variables for retriever and paper metadata
+retriever = None
+paper_metadata = {}
 
-if not os.path.exists(papers_folder):
-    raise FileNotFoundError(f"Papers folder not found: {papers_folder}")
-
-# Get all PDF files from the papers folder
-pdf_files = []
-for file in os.listdir(papers_folder):
-    if file.lower().endswith('.pdf'):
-        pdf_files.append(os.path.join(papers_folder, file))
-
-if not pdf_files:
-    raise FileNotFoundError(f"No PDF files found in folder: {papers_folder}")
-
-print(f"Found {len(pdf_files)} PDF files to process")
-
-# Load all PDFs and preserve metadata
-all_pages = []
-paper_metadata = {}  # Store paper-level metadata
-
-for pdf_file in pdf_files:
-    try:
-        pdf_loader = PyPDFLoader(pdf_file)
-        pages = pdf_loader.load()
-        
-        # Extract paper filename for reference
-        paper_name = os.path.basename(pdf_file).replace('.pdf', '')
-        
-        # Add paper source to each page's metadata
-        for i, page in enumerate(pages):
-            page.metadata['paper_name'] = paper_name
-            page.metadata['paper_path'] = pdf_file
-            page.metadata['page_number'] = i + 1
-            
-            # Try to extract title and authors from first few pages
-            if i < 3:  # Check first 3 pages for title/authors
-                text = page.page_content.lower()
-                if 'abstract' in text or 'introduction' in text:
-                    # This is likely a research paper format
-                    page.metadata['likely_metadata_page'] = True
-        
-        all_pages.extend(pages)
-        paper_metadata[paper_name] = {
-            'path': pdf_file,
-            'total_pages': len(pages),
-            'first_page_content': pages[0].page_content[:500] if pages else ""
-        }
-        
-        print(f"Loaded {pdf_file}: {len(pages)} pages")
-    except Exception as e:
-        print(f"Error loading {pdf_file}: {e}")
-        continue
-
-print(f"Total pages loaded from all PDFs: {len(all_pages)}")
-
-# Improved chunking strategy for research papers
-text_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=2000,  # Increased for better context
-    chunk_overlap=400,  # Increased overlap
-    separators=["\n\n", "\n", ". ", " ", ""]  # Better separators for academic text
-)
-
-pages_split = text_splitter.split_documents(all_pages)
-
-# Enhance chunk metadata
-for chunk in pages_split:
-    # Add more context to each chunk
-    chunk.metadata['chunk_type'] = 'content'
-    text_lower = chunk.page_content.lower()
-    
-    # Identify chunk types
-    if any(keyword in text_lower for keyword in ['abstract', 'summary']):
-        chunk.metadata['chunk_type'] = 'abstract'
-    elif any(keyword in text_lower for keyword in ['introduction', 'background']):
-        chunk.metadata['chunk_type'] = 'introduction'
-    elif any(keyword in text_lower for keyword in ['conclusion', 'discussion']):
-        chunk.metadata['chunk_type'] = 'conclusion'
-    elif any(keyword in text_lower for keyword in ['method', 'approach', 'algorithm']):
-        chunk.metadata['chunk_type'] = 'methodology'
-    elif any(keyword in text_lower for keyword in ['result', 'experiment', 'evaluation']):
-        chunk.metadata['chunk_type'] = 'results'
-    elif any(keyword in text_lower for keyword in ['reference', 'bibliography']):
-        chunk.metadata['chunk_type'] = 'references'
-
-persist_directory = r"/Users/seunghoonhan/langgraph"
-collection_name = "papers_collection_improved"
-
-if not os.path.exists(persist_directory):
-    os.makedirs(persist_directory)
-
-try:
-    vectorstore = Chroma.from_documents(
-        documents=pages_split,
-        embedding=embeddings,
-        persist_directory=persist_directory,
-        collection_name=collection_name
-    )
-    print(f"Created ChromaDB vector store with {len(pages_split)} chunks!")
-except Exception as e:
-    print(f"Error setting up ChromaDB: {str(e)}")
-    raise
-
-# Improved retriever with multiple search strategies
-retriever = vectorstore.as_retriever(
-    search_type="similarity",
-    search_kwargs={"k": 15}  # Increased from 5
-)
-
-# Define tools (keeping your existing tools)
+# Define tools
 @tool
 def list_papers_tool(query: str = "") -> str:
-    """
-    Lists all papers in the database with basic information like titles and page counts.
-    """
+    """Lists all papers in the database with basic information like titles and page counts."""
     paper_list = []
     for paper_name, metadata in paper_metadata.items():
-        # Try to extract title from first page
         first_page = metadata['first_page_content']
         lines = first_page.split('\n')
         potential_title = lines[0].strip() if lines else paper_name
@@ -186,44 +117,45 @@ def list_papers_tool(query: str = "") -> str:
 
 @tool
 def retriever_tool(query: str) -> str:
-    """
-    This tool searches and returns the most relevant information from the research papers.
-    It includes paper names, page numbers, and section types for better context.
-    """
-    docs = retriever.invoke(query)
+    """Searches and returns the most relevant information from research papers."""
+    if not retriever:
+        return "PDF retriever not initialized. Please check if PDFs are properly ingested."
     
-    if not docs:
-        return "I found no relevant information in the documents"
-    
-    results = []
-    seen_content = set()  # Avoid duplicate content
-    
-    for i, doc in enumerate(docs):
-        # Skip if we've seen very similar content
-        content_hash = hash(doc.page_content[:200])
-        if content_hash in seen_content:
-            continue
-        seen_content.add(content_hash)
+    try:
+        docs = retriever.invoke(query)
         
-        paper_name = doc.metadata.get('paper_name', 'Unknown Paper')
-        page_num = doc.metadata.get('page_number', 'Unknown Page')
-        chunk_type = doc.metadata.get('chunk_type', 'content')
+        if not docs:
+            return "I found no relevant information in the documents"
         
-        result = f"**Paper: {paper_name}** (Page {page_num}, {chunk_type})\n{doc.page_content}\n"
-        results.append(result)
+        results = []
+        seen_content = set()
         
-        # Limit to top 8 most relevant chunks to avoid overwhelming
-        if len(results) >= 8:
-            break
-    
-    return "\n" + "="*80 + "\n".join(results)
+        for i, doc in enumerate(docs):
+            content_hash = hash(doc.page_content[:200])
+            if content_hash in seen_content:
+                continue
+            seen_content.add(content_hash)
+            
+            paper_name = doc.metadata.get('paper_name', 'Unknown Paper')
+            page_num = doc.metadata.get('page_number', 'Unknown Page')
+            chunk_type = doc.metadata.get('chunk_type', 'content')
+            
+            result = f"**Paper: {paper_name}** (Page {page_num}, {chunk_type})\n{doc.page_content}\n"
+            results.append(result)
+            
+            if len(results) >= 8:
+                break
+        
+        return "\n" + "="*80 + "\n".join(results)
+    except Exception as e:
+        return f"Error searching documents: {str(e)}"
 
 @tool
 def search_specific_paper_tool(query: str) -> str:
-    """
-    Search within a specific paper. Format: "paper_name: your_query"
-    Example: "paper1: methodology for classification"
-    """
+    """Search within a specific paper. Format: 'paper_name: your_query'"""
+    if not retriever:
+        return "PDF retriever not initialized. Please check if PDFs are properly ingested."
+    
     if ":" not in query:
         return "Please format your query as 'paper_name: your_question'"
     
@@ -231,30 +163,28 @@ def search_specific_paper_tool(query: str) -> str:
     paper_name = paper_name.strip()
     search_query = search_query.strip()
     
-    # Search with paper name filter
-    docs = retriever.invoke(search_query)
-    
-    # Filter results to specific paper
-    filtered_docs = [doc for doc in docs if doc.metadata.get('paper_name', '').lower() == paper_name.lower()]
-    
-    if not filtered_docs:
-        return f"No relevant information found in paper '{paper_name}' for query '{search_query}'"
-    
-    results = []
-    for i, doc in enumerate(filtered_docs[:5]):  # Top 5 results
-        page_num = doc.metadata.get('page_number', 'Unknown Page')
-        chunk_type = doc.metadata.get('chunk_type', 'content')
+    try:
+        docs = retriever.invoke(search_query)
+        filtered_docs = [doc for doc in docs if doc.metadata.get('paper_name', '').lower() == paper_name.lower()]
         
-        result = f"**{paper_name}** (Page {page_num}, {chunk_type})\n{doc.page_content}\n"
-        results.append(result)
-    
-    return "\n" + "="*80 + "\n".join(results)
+        if not filtered_docs:
+            return f"No relevant information found in paper '{paper_name}' for query '{search_query}'"
+        
+        results = []
+        for i, doc in enumerate(filtered_docs[:5]):
+            page_num = doc.metadata.get('page_number', 'Unknown Page')
+            chunk_type = doc.metadata.get('chunk_type', 'content')
+            
+            result = f"**{paper_name}** (Page {page_num}, {chunk_type})\n{doc.page_content}\n"
+            results.append(result)
+        
+        return "\n" + "="*80 + "\n".join(results)
+    except Exception as e:
+        return f"Error searching specific paper: {str(e)}"
 
 @tool
 def web_search_tool(query: str) -> str:
-    """
-    This tool searches the web for current information.
-    """
+    """Searches the web for current information."""
     try:
         search = GoogleSerperAPIWrapper()
         result = search.run(query)
@@ -275,27 +205,19 @@ class MultiAgentRAGSystem:
     def _build_graph(self):
         """Build the multi-agent workflow graph."""
         
-        # Agent 1: Clarification Agent
         def clarification_agent(state: AgentState) -> AgentState:
-            """Agent to detect ONLY truly ambiguous queries that need clarification."""
+            """Agent to detect ambiguous queries that need clarification."""
             query = state["user_query"].lower()
             
-            # Only ask for clarification for very specific problematic patterns
             clarification_patterns = [
-                # Vague quantifiers without any context
                 (r'\b(enough|sufficient)\b.*\b(accuracy|performance)\b', "What specific accuracy threshold or dataset are you targeting?"),
                 (r'\b(best|better)\b(?!.*\b(than|compared)\b)', "Better compared to what baseline or method?"),
                 (r'\bhow many\b.*\benough\b', "Enough for what specific task or performance level?"),
                 (r'\b(good|bad)\b.*\bresults?\b(?!.*\b(than|compared)\b)', "What defines 'good' results for your use case?"),
-                
-                # Completely context-free pronouns at start
                 (r'^(it|that|this|they)\b', "What specific paper, method, or concept are you referring to?"),
-                
-                # Questions with no searchable content
                 (r'^(what|how|why)\s+(is|are|does|do)\s+(it|that|this)\b', "Could you specify what you're asking about?")
             ]
             
-            # Check if query matches problematic patterns
             for pattern, clarification_msg in clarification_patterns:
                 if re.search(pattern, query):
                     return {
@@ -305,7 +227,6 @@ class MultiAgentRAGSystem:
                         "agent_reasoning": f"Clarification agent detected pattern: {pattern}"
                     }
             
-            # Special handling for very short, context-free queries
             words = query.split()
             if len(words) <= 2 and any(word in ['it', 'that', 'this', 'they'] for word in words):
                 return {
@@ -315,20 +236,16 @@ class MultiAgentRAGSystem:
                     "agent_reasoning": "Clarification agent detected very short context-free query"
                 }
             
-            # For searchable queries (like "zhang et al", "methodology", etc.), proceed
-            # These can be handled by the retrieval system
             return {
                 **state,
                 "clarification_needed": False,
                 "agent_reasoning": "Clarification agent approved query - contains searchable content"
             }
         
-        # Agent 2: Router Agent
         def router_agent(state: AgentState) -> AgentState:
             """Agent to decide the search strategy: PDF, Web, or Both."""
             query = state["user_query"].lower()
             
-            # Rule-based routing for common patterns
             pdf_keywords = [
                 "papers", "documents", "list papers", "what papers", "available papers",
                 "authors", "methodology", "accuracy", "results", "dataset", "experiment",
@@ -340,7 +257,6 @@ class MultiAgentRAGSystem:
                 "openai release", "google release", "new model", "breaking news"
             ]
             
-            # Check for direct matches first
             if any(keyword in query for keyword in ["what papers", "list papers", "papers do you have", "available papers"]):
                 decision = "PDF"
             elif any(keyword in query for keyword in web_keywords):
@@ -348,34 +264,13 @@ class MultiAgentRAGSystem:
             elif any(keyword in query for keyword in pdf_keywords):
                 decision = "PDF"
             else:
-                # Use LLM for complex queries
                 router_prompt = f"""
                 Analyze this query and decide the best search strategy: "{query}"
                 
                 Strategy Guidelines:
-                
-                1. **PDF Strategy** - Use when query asks about:
-                   - Specific research papers, authors, methodologies
-                   - Academic results, experiments, datasets mentioned in papers
-                   - Citations like "Zhang et al. (2024)", "Spider dataset"
-                   - Technical details from research (accuracy scores, prompt templates)
-                   - Content that would be in academic papers
-                
-                2. **WEB Strategy** - Use when query asks about:
-                   - Recent events, current news, "this month", "recently released"
-                   - Companies and their latest products/releases
-                   - Real-time information, current status
-                   - General knowledge not specific to research papers
-                
-                3. **BOTH Strategy** - Use when query needs:
-                   - Comparison between paper content and current state
-                   - Academic context + current developments
-                   - Background from papers + recent updates
-                
-                Examples:
-                - "Which prompt template gave highest accuracy on Spider in Zhang et al.?" → PDF
-                - "What did OpenAI release this month?" → WEB
-                - "How do the results in these papers compare to current SOTA?" → BOTH
+                1. **PDF Strategy** - Use for research papers, academic content, methodologies
+                2. **WEB Strategy** - Use for recent events, current news, company releases
+                3. **BOTH Strategy** - Use when needing both academic context and current info
                 
                 Respond with exactly one word: PDF, WEB, or BOTH
                 """
@@ -384,9 +279,8 @@ class MultiAgentRAGSystem:
                 response = llm.invoke(messages)
                 decision = response.content.strip().upper()
                 
-                # Ensure valid decision
                 if decision not in ["PDF", "WEB", "BOTH"]:
-                    decision = "PDF"  # Default to PDF for academic queries
+                    decision = "PDF"
             
             return {
                 **state,
@@ -394,7 +288,6 @@ class MultiAgentRAGSystem:
                 "agent_reasoning": f"Router agent decided: {decision}"
             }
         
-        # Agent 3: PDF Research Agent
         def pdf_research_agent(state: AgentState) -> AgentState:
             """Agent specialized in searching and analyzing PDF content."""
             query = state["user_query"].lower()
@@ -413,16 +306,14 @@ class MultiAgentRAGSystem:
             - For content questions, use retriever_tool to search across all papers
             - Always cite specific papers, page numbers, and section types
             - Provide exact quotes and numbers when available
-            - Include confidence indicators if information is uncertain
             
             Focus on accuracy and scholarly precision.
             """
             
-            # Determine which tool to use based on query
             if any(phrase in query for phrase in ["what papers", "list papers", "papers do you have", "available papers"]):
                 tool_suggestion = "Use list_papers_tool to show all available papers."
             elif any(author in query for author in ["zhang", "smith", "author"]):
-                tool_suggestion = "Use retriever_tool to search for author mentions and specific content. The retriever_tool works better for author-based queries."
+                tool_suggestion = "Use retriever_tool to search for author mentions and specific content."
             else:
                 tool_suggestion = "Use retriever_tool to search for relevant content across all papers."
             
@@ -439,25 +330,14 @@ class MultiAgentRAGSystem:
                 "agent_reasoning": state.get("agent_reasoning", "") + " | PDF research agent activated"
             }
         
-        # Agent 4: Web Research Agent
         def web_research_agent(state: AgentState) -> AgentState:
             """Agent specialized in web search for current information."""
             query = state["user_query"]
             
             web_system_prompt = """
             You are a web research specialist focused on finding current, real-time information.
-            
-            Use the web_search_tool to find:
-            - Recent developments and news
-            - Current company releases and announcements
-            - Latest research and publications
-            - Real-time data and statistics
-            
-            Provide:
-            - Source URLs when possible
-            - Publication dates for currency
-            - Clear distinction between verified facts and claims
-            - Context about reliability of sources
+            Use the web_search_tool to find recent developments, news, company releases, and current data.
+            Provide source URLs when possible and publication dates for currency.
             """
             
             messages = [
@@ -473,7 +353,6 @@ class MultiAgentRAGSystem:
                 "agent_reasoning": state.get("agent_reasoning", "") + " | Web research agent activated"
             }
         
-        # Agent 5: Tool Execution Agent
         def tool_execution_agent(state: AgentState) -> AgentState:
             """Execute tool calls from research agents."""
             last_message = state["messages"][-1]
@@ -486,7 +365,7 @@ class MultiAgentRAGSystem:
                 tool_name = tool_call["name"]
                 tool_args = tool_call["args"]
                 
-                print(f"Executing Tool: {tool_name} with args: {tool_args}")
+                logger.info(f"Executing Tool: {tool_name} with args: {tool_args}")
                 
                 if tool_name in tools_dict:
                     try:
@@ -498,7 +377,6 @@ class MultiAgentRAGSystem:
                                 content=str(result)
                             )
                         )
-                        print(f"Tool {tool_name} executed successfully")
                     except Exception as e:
                         error_msg = f"Error executing {tool_name}: {str(e)}"
                         tool_messages.append(
@@ -508,7 +386,7 @@ class MultiAgentRAGSystem:
                                 content=error_msg
                             )
                         )
-                        print(error_msg)
+                        logger.error(error_msg)
                 else:
                     error_msg = f"Tool {tool_name} not found. Available: {list(tools_dict.keys())}"
                     tool_messages.append(
@@ -524,14 +402,12 @@ class MultiAgentRAGSystem:
                 "messages": state["messages"] + tool_messages
             }
         
-        # Agent 6: Response Synthesis Agent
         def response_synthesis_agent(state: AgentState) -> AgentState:
             """Generate final comprehensive response."""
             query = state["user_query"]
             messages = state.get("messages", [])
             strategy = state.get("search_strategy", "pdf")
             
-            # Extract tool results content for synthesis (avoid tool call format issues)
             tool_results = []
             for msg in messages:
                 if hasattr(msg, 'content') and isinstance(msg.content, str):
@@ -552,15 +428,9 @@ class MultiAgentRAGSystem:
             5. Indicate confidence level if uncertain
             6. Suggest follow-up questions if relevant
             
-            Format:
-            - Start with a direct answer
-            - Provide supporting evidence
-            - End with any caveats or additional context
-            
             Be scholarly, precise, and helpful.
             """
             
-            # Use simple message format to avoid tool call issues
             synthesis_messages = [
                 SystemMessage(content=synthesis_prompt),
                 HumanMessage(content=f"Synthesize a final answer for: {query}")
@@ -581,18 +451,18 @@ class MultiAgentRAGSystem:
         def route_after_router(state: AgentState) -> str:
             strategy = state.get("search_strategy", "pdf").lower()
             if strategy == "both":
-                return "pdf_research"  # Start with PDF, then web
+                return "pdf_research"
             elif strategy == "web":
                 return "web_research"
             else:
-                return "pdf_research"  # Default to PDF
+                return "pdf_research"
         
         def route_after_pdf_research(state: AgentState) -> str:
             last_message = state["messages"][-1]
             if hasattr(last_message, 'tool_calls') and last_message.tool_calls:
                 return "tool_execution"
             elif state.get("search_strategy") == "both":
-                return "web_research"  # Continue to web for "both" strategy
+                return "web_research"
             else:
                 return "response_synthesis"
         
@@ -604,9 +474,7 @@ class MultiAgentRAGSystem:
                 return "response_synthesis"
         
         def route_after_tool_execution(state: AgentState) -> str:
-            # Check if we need to continue with the other search strategy
             if state.get("search_strategy") == "both":
-                # Check if we've done both PDF and web research
                 reasoning = state.get("agent_reasoning", "")
                 if "PDF research agent activated" in reasoning and "Web research agent activated" not in reasoning:
                     return "web_research"
@@ -615,7 +483,6 @@ class MultiAgentRAGSystem:
         # Build the graph
         workflow = StateGraph(AgentState)
         
-        # Add all agents as nodes
         workflow.add_node("clarification", clarification_agent)
         workflow.add_node("router", router_agent)
         workflow.add_node("pdf_research", pdf_research_agent)
@@ -623,53 +490,36 @@ class MultiAgentRAGSystem:
         workflow.add_node("tool_execution", tool_execution_agent)
         workflow.add_node("response_synthesis", response_synthesis_agent)
         
-        # Define the workflow
         workflow.set_entry_point("clarification")
         
         workflow.add_conditional_edges(
             "clarification",
             route_after_clarification,
-            {
-                "end": END,
-                "router": "router"
-            }
+            {"end": END, "router": "router"}
         )
         
         workflow.add_conditional_edges(
             "router",
             route_after_router,
-            {
-                "pdf_research": "pdf_research",
-                "web_research": "web_research"
-            }
+            {"pdf_research": "pdf_research", "web_research": "web_research"}
         )
         
         workflow.add_conditional_edges(
             "pdf_research",
             route_after_pdf_research,
-            {
-                "tool_execution": "tool_execution",
-                "web_research": "web_research",
-                "response_synthesis": "response_synthesis"
-            }
+            {"tool_execution": "tool_execution", "web_research": "web_research", "response_synthesis": "response_synthesis"}
         )
         
         workflow.add_conditional_edges(
             "web_research",
             route_after_web_research,
-            {
-                "tool_execution": "tool_execution",
-                "response_synthesis": "response_synthesis"
-            }
+            {"tool_execution": "tool_execution", "response_synthesis": "response_synthesis"}
         )
         
         workflow.add_conditional_edges(
             "tool_execution",
             route_after_tool_execution,
-            {
-                "web_research": "web_research",
-                "response_synthesis": "response_synthesis"
-            }
+            {"web_research": "web_research", "response_synthesis": "response_synthesis"}
         )
         
         workflow.add_edge("response_synthesis", END)
@@ -689,7 +539,6 @@ class MultiAgentRAGSystem:
         if not session:
             return {"error": "Invalid session ID", "session_id": session_id}
         
-        # Prepare initial state
         initial_state = {
             "messages": [],
             "session_id": session_id,
@@ -701,15 +550,11 @@ class MultiAgentRAGSystem:
             "final_response": ""
         }
         
-        print(f"\n=== PROCESSING QUERY ===")
-        print(f"Question: {question}")
-        print(f"Session: {session_id}")
+        logger.info(f"Processing query: {question} (Session: {session_id})")
         
         try:
-            # Run the multi-agent workflow
             result = self.graph.invoke(initial_state)
             
-            # Handle clarification requests
             if result.get("clarification_needed", False):
                 return {
                     "response": result["final_response"],
@@ -718,7 +563,6 @@ class MultiAgentRAGSystem:
                     "reasoning": result.get("agent_reasoning", "")
                 }
             
-            # Update session history
             session_messages = session.get("messages", [])
             session_messages.extend([question, result["final_response"]])
             self.session_manager.update_session(session_id, session_messages)
@@ -733,6 +577,7 @@ class MultiAgentRAGSystem:
             }
             
         except Exception as e:
+            logger.error(f"Error processing query: {str(e)}")
             return {
                 "error": f"Error processing query: {str(e)}",
                 "session_id": session_id,
@@ -749,58 +594,165 @@ class MultiAgentRAGSystem:
         session = self.session_manager.get_session(session_id)
         return session.get("messages", []) if session else []
 
-# Initialize the multi-agent system
-multi_agent_rag = MultiAgentRAGSystem()
+# Global instance
+multi_agent_rag = None
 
-def running_agent():
-    """Console interface for testing the multi-agent system."""
-    print("\n=== MULTI-AGENT RAG SYSTEM ===")
-    print("This system uses 6 specialized agents:")
-    print("1. Clarification Agent - Detects ambiguous queries")
-    print("2. Router Agent - Decides search strategy (PDF/Web/Both)")
-    print("3. PDF Research Agent - Searches academic papers")
-    print("4. Web Research Agent - Searches current information")
-    print("5. Tool Execution Agent - Executes research tools")
-    print("6. Response Synthesis Agent - Creates final answers")
-    print("\nCommands:")
-    print("- 'new session' - Start a new conversation session")
-    print("- 'clear' - Clear current session")
-    print("- 'exit' or 'quit' - Exit the system")
-    print("- Ask any question about research papers or current topics")
+async def startup_event():
+    """Initialize services on startup."""
+    global retriever, paper_metadata, multi_agent_rag
     
-    session_id = multi_agent_rag.create_session()
-    print(f"\nSession created: {session_id}")
+    try:
+        logger.info("Initializing PDF service...")
+        pdf_svc = init_pdf_service()
+        retriever = pdf_svc.get_retriever()
+        paper_metadata = pdf_svc.paper_metadata
+        
+        logger.info("Initializing multi-agent RAG system...")
+        multi_agent_rag = MultiAgentRAGSystem()
+        
+        logger.info("Startup complete!")
+    except Exception as e:
+        logger.error(f"Startup failed: {str(e)}")
+        raise
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    await startup_event()
+    yield
+    # Shutdown
+    logger.info("Shutting down...")
+
+# Initialize FastAPI app
+app = FastAPI(
+    title="Multi-Agent RAG System",
+    description="A sophisticated multi-agent system for research paper analysis and web search",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# API Endpoints
+@app.get("/")
+async def root():
+    """Root endpoint with API information."""
+    return {
+        "message": "Multi-Agent RAG System API",
+        "version": "1.0.0",
+        "endpoints": {
+            "ask": "POST /ask - Ask a question",
+            "session": "POST /session - Create new session",
+            "session_history": "GET /session/{session_id}/history - Get session history",
+            "clear_session": "DELETE /session/{session_id} - Clear session",
+            "ingest": "POST /ingest - Re-ingest PDFs",
+            "health": "GET /health - Health check"
+        }
+    }
+
+@app.post("/ask", response_model=QuestionResponse)
+async def ask_question(request: QuestionRequest):
+    """Ask a question to the multi-agent system."""
+    if not multi_agent_rag:
+        raise HTTPException(status_code=503, detail="System not initialized")
     
-    while True:
-        user_input = input("\nYour question: ")
-        
-        if user_input.lower() in ['exit', 'quit']:
-            break
-        
-        if user_input.lower() == 'new session':
-            session_id = multi_agent_rag.create_session()
-            print(f"New session created: {session_id}")
-            continue
-            
-        if user_input.lower() == 'clear':
-            multi_agent_rag.clear_session(session_id)
-            print("Session history cleared")
-            continue
-        
-        # Process the question
-        result = multi_agent_rag.ask_question(user_input, session_id)
+    try:
+        result = multi_agent_rag.ask_question(request.question, request.session_id)
         
         if "error" in result:
-            print(f"\n❌ Error: {result['error']}")
+            raise HTTPException(status_code=400, detail=result["error"])
+        
+        return QuestionResponse(**result)
+    except Exception as e:
+        logger.error(f"Error in ask_question: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+@app.post("/session", response_model=SessionResponse)
+async def create_session():
+    """Create a new conversation session."""
+    if not multi_agent_rag:
+        raise HTTPException(status_code=503, detail="System not initialized")
+    
+    try:
+        session_id = multi_agent_rag.create_session()
+        return SessionResponse(session_id=session_id, message="Session created successfully")
+    except Exception as e:
+        logger.error(f"Error creating session: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+@app.get("/session/{session_id}/history")
+async def get_session_history(session_id: str):
+    """Get conversation history for a session."""
+    if not multi_agent_rag:
+        raise HTTPException(status_code=503, detail="System not initialized")
+    
+    try:
+        history = multi_agent_rag.get_session_history(session_id)
+        return {"session_id": session_id, "history": history}
+    except Exception as e:
+        logger.error(f"Error getting session history: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+@app.delete("/session/{session_id}")
+async def clear_session(session_id: str):
+    """Clear conversation history for a session."""
+    if not multi_agent_rag:
+        raise HTTPException(status_code=503, detail="System not initialized")
+    
+    try:
+        success = multi_agent_rag.clear_session(session_id)
+        if success:
+            return {"message": "Session cleared successfully", "session_id": session_id}
         else:
-            print(f"\n=== RESPONSE ===")
-            print(f"Type: {result.get('type', 'unknown')}")
-            if result.get('search_strategy'):
-                print(f"Strategy: {result['search_strategy'].upper()}")
-            print(f"\n{result['response']}")
-            
-            if result.get('reasoning'):
-                print(f"\n🔍 Agent Reasoning: {result['reasoning']}")
+            raise HTTPException(status_code=404, detail="Session not found")
+    except Exception as e:
+        logger.error(f"Error clearing session: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+@app.post("/ingest", response_model=IngestionResponse)
+async def reingest_pdfs(background_tasks: BackgroundTasks):
+    """Re-ingest PDFs (useful for when new PDFs are added)."""
+    try:
+        result = pdf_service.ingest_pdfs()
+        
+        if result["status"] == "error":
+            raise HTTPException(status_code=400, detail=result["message"])
+        
+        # Update global variables
+        global retriever, paper_metadata
+        retriever = pdf_service.get_retriever()
+        paper_metadata = pdf_service.paper_metadata
+        
+        return IngestionResponse(**result)
+    except Exception as e:
+        logger.error(f"Error re-ingesting PDFs: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint."""
+    global retriever, paper_metadata, multi_agent_rag
+    
+    status = {
+        "status": "healthy",
+        "pdf_service": retriever is not None,
+        "papers_loaded": len(paper_metadata) if paper_metadata else 0,
+        "agent_system": multi_agent_rag is not None
+    }
+    
+    if not all([retriever, multi_agent_rag]):
+        status["status"] = "degraded"
+        return status, 503
+    
+    return status
 
 if __name__ == "__main__":
-    running_agent()
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
