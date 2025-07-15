@@ -178,22 +178,6 @@ The system uses a multi-agent architecture built with LangGraph:
 - **Web**: Search only current web information  
 - **Both**: Search papers first, then web for comprehensive answers
 
-## Troubleshooting
-
-### Common Issues
-
-1. **PDF files not found**: Ensure PDFs are in the `papers/` directory
-2. **OpenAI API errors**: Verify your API key is correct and has sufficient credits
-3. **Web search not working**: Check your Serper API key or disable web search
-4. **Vector store issues**: Delete the vector store directory and restart to rebuild
-
-### Logs
-
-Check application logs for detailed error information:
-
-```bash
-docker-compose logs rag-api
-```
 
 ## Development
 
@@ -272,7 +256,15 @@ This system was designed with several conscious trade-offs for simplicity and ra
    - Add response caching for common queries
    - Optimize vector search with better indexing
 
-5. **Basic Security & Scaling**
+5. **Enhanced Document Indexing**
+   - Add metadata indexes for fast paper name and author lookups
+   - Implement chunk type indexing (abstract, methodology, results, conclusion)
+   - Create page range indexes for targeted section searches
+   - Add composite indexes for multi-field queries (paper + section type)
+   - Implement full-text search indexes for exact phrase matching
+   - Add temporal indexing for publication dates and citation tracking
+
+6. **Basic Security & Scaling**
    - Add API rate limiting and request throttling
    - Implement basic input validation and sanitization
    - Add health checks and readiness probes for containers
