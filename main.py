@@ -94,7 +94,7 @@ class SessionManager:
             self.sessions[session_id]["messages"] = []
 
 # Initialize LLM
-llm = ChatOpenAI(model="gpt-4o", temperature=0)
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
 # Global variables for retriever and paper metadata
 retriever = None
@@ -243,8 +243,17 @@ class MultiAgentRAGSystem:
             }
         
         def router_agent(state: AgentState) -> AgentState:
-            """Agent to decide the search strategy: PDF, Web, or Both."""
+            """Agent to decide the search strategy: PDF, Web, Both, or Conversational."""
             query = state["user_query"].lower()
+            
+            # Conversational patterns that don't need search
+            conversational_patterns = [
+                "hi", "hello", "what do you do", "how are you", "my name is", "i'm", "im",
+                "thank you", "thanks", "goodbye", "bye", "what are you", "who are you",
+                "what is your name", "introduce yourself", "tell me about yourself",
+                "remind me", "what did i say", "my name", "whats my name", "what's my name",
+                "do you remember", "earlier i", "i told you", "i mentioned"
+            ]
             
             pdf_keywords = [
                 "papers", "documents", "list papers", "what papers", "available papers",
@@ -257,7 +266,10 @@ class MultiAgentRAGSystem:
                 "openai release", "google release", "new model", "breaking news"
             ]
             
-            if any(keyword in query for keyword in ["what papers", "list papers", "papers do you have", "available papers"]):
+            # Check for conversational queries first
+            if any(pattern in query for pattern in conversational_patterns):
+                decision = "CONVERSATIONAL"
+            elif any(keyword in query for keyword in ["what papers", "list papers", "papers do you have", "available papers"]):
                 decision = "PDF"
             elif any(keyword in query for keyword in web_keywords):
                 decision = "WEB"
@@ -268,24 +280,86 @@ class MultiAgentRAGSystem:
                 Analyze this query and decide the best search strategy: "{query}"
                 
                 Strategy Guidelines:
-                1. **PDF Strategy** - Use for research papers, academic content, methodologies
-                2. **WEB Strategy** - Use for recent events, current news, company releases
-                3. **BOTH Strategy** - Use when needing both academic context and current info
+                1. **CONVERSATIONAL** - Use for greetings, introductions, general chat, questions about the system itself
+                2. **PDF Strategy** - Use for research papers, academic content, methodologies
+                3. **WEB Strategy** - Use for recent events, current news, company releases
+                4. **BOTH Strategy** - Use when needing both academic context and current info
                 
-                Respond with exactly one word: PDF, WEB, or BOTH
+                Respond with exactly one word: CONVERSATIONAL, PDF, WEB, or BOTH
                 """
                 
                 messages = [HumanMessage(content=router_prompt)]
                 response = llm.invoke(messages)
                 decision = response.content.strip().upper()
                 
-                if decision not in ["PDF", "WEB", "BOTH"]:
-                    decision = "PDF"
+                if decision not in ["CONVERSATIONAL", "PDF", "WEB", "BOTH"]:
+                    decision = "CONVERSATIONAL"
             
             return {
                 **state,
                 "search_strategy": decision.lower(),
                 "agent_reasoning": f"Router agent decided: {decision}"
+            }
+        
+        def conversational_agent(state: AgentState) -> AgentState:
+            """Agent for handling conversational queries without search."""
+            query = state["user_query"]
+            messages = state.get("messages", [])
+            
+            # Extract conversation context
+            conversation_context = ""
+            for msg in messages:
+                if isinstance(msg, (HumanMessage, SystemMessage)) and hasattr(msg, 'content') and msg.content:
+                    if msg.content.startswith("Previous response:"):
+                        conversation_context += f"Context: {msg.content}\n"
+                    else:
+                        # Check if this is a tool message (avoid None issues)
+                        msg_name = getattr(msg, 'name', '') or ''
+                        if not any(tool_name in msg_name for tool_name in ['retriever_tool', 'list_papers_tool', 'search_specific_paper_tool', 'web_search_tool']):
+                            conversation_context += f"Previous: {msg.content}\n"
+            
+            # Fix f-string backslash issue
+            newline = "\n"
+            conversation_section = f"Conversation History:{newline}{conversation_context}" if conversation_context else ""
+            
+            conversational_prompt = f"""
+            You are a helpful AI assistant for a Multi-Agent RAG (Retrieval-Augmented Generation) System.
+            
+            Your system capabilities:
+            - Analyze research papers and academic documents
+            - Search current web information
+            - Answer questions using both PDF documents and web search
+            - Maintain conversation context and memory
+            - Provide confidence scores for responses
+            
+            {conversation_section}
+            
+            The user said: "{query}"
+            
+            Provide a friendly, helpful response. If they're introducing themselves, remember their name.
+            If they're asking what you do, explain your capabilities clearly.
+            If this is a greeting, respond warmly and offer to help.
+            
+            Be conversational, helpful, and personable.
+            """
+            
+            conv_messages = [
+                SystemMessage(content=conversational_prompt),
+                HumanMessage(content=query)
+            ]
+            
+            response = llm.invoke(conv_messages)
+            
+            # Simple confidence for conversational responses
+            confidence = 0.8  # High confidence for direct conversational responses
+            if conversation_context:
+                confidence = 0.9  # Even higher if we have context
+            
+            return {
+                **state,
+                "final_response": response.content or "Hello! I'm here to help.",
+                "confidence_score": confidence,
+                "agent_reasoning": state.get("agent_reasoning", "") + f" | Conversational agent activated (confidence: {confidence:.2f})"
             }
         
         def pdf_research_agent(state: AgentState) -> AgentState:
@@ -403,32 +477,61 @@ class MultiAgentRAGSystem:
             }
         
         def response_synthesis_agent(state: AgentState) -> AgentState:
-            """Generate final comprehensive response."""
+            """Generate final comprehensive response with confidence calculation."""
             query = state["user_query"]
             messages = state.get("messages", [])
             strategy = state.get("search_strategy", "pdf")
+            reasoning = state.get("agent_reasoning", "")
             
             tool_results = []
+            successful_tools = []
+            error_count = 0
+            
             for msg in messages:
                 if hasattr(msg, 'content') and isinstance(msg.content, str):
                     if hasattr(msg, 'name') and msg.name in ['retriever_tool', 'list_papers_tool', 'search_specific_paper_tool', 'web_search_tool']:
                         tool_results.append(f"From {msg.name}: {msg.content}")
+                        successful_tools.append(msg.name)
+                        
+                        # Check for errors in tool results
+                        if msg.content and any(error_phrase in msg.content.lower() for error_phrase in ['error', 'failed', 'not found', 'no relevant information']):
+                            error_count += 1
+            
+            # Extract conversation context
+            conversation_context = ""
+            for msg in messages:
+                if isinstance(msg, (HumanMessage, SystemMessage)) and hasattr(msg, 'content') and msg.content:
+                    if msg.content.startswith("Previous response:"):
+                        conversation_context += f"Context: {msg.content}\n"
+                    else:
+                        # Check if this is a tool message (avoid None issues)
+                        msg_name = getattr(msg, 'name', '') or ''
+                        if not any(tool_name in msg_name for tool_name in ['retriever_tool', 'list_papers_tool', 'search_specific_paper_tool', 'web_search_tool']):
+                            conversation_context += f"Previous: {msg.content}\n"
+            
+            # Fix f-string backslash issues by extracting variables
+            newline = "\n"
+            conversation_section = f"Conversation History:{newline}{conversation_context}" if conversation_context else ""
+            research_results = newline.join(tool_results) if tool_results else "No tool results available."
             
             synthesis_prompt = f"""
             Based on the research conducted, provide a comprehensive answer to: "{query}"
             
+            {conversation_section}
+            
             Research results:
-            {chr(10).join(tool_results) if tool_results else "No tool results available."}
+            {research_results}
             
             Your response should:
-            1. Directly answer the user's question
-            2. Cite specific sources with page numbers (for PDF content)
-            3. Include exact quotes and numerical data when available
-            4. Mention the search strategy used: {strategy}
-            5. Indicate confidence level if uncertain
-            6. Suggest follow-up questions if relevant
+            1. Directly answer the user's question, considering previous conversation context
+            2. Reference previous conversation when relevant (e.g., "As you mentioned earlier...")
+            3. Cite specific sources with page numbers (for PDF content)
+            4. Include exact quotes and numerical data when available
+            5. Mention the search strategy used: {strategy}
+            6. Indicate confidence level if uncertain
+            7. Suggest follow-up questions if relevant
             
-            Be scholarly, precise, and helpful.
+            Be scholarly, precise, and helpful. Use conversation history to provide personalized responses.
             """
             
             synthesis_messages = [
@@ -438,10 +541,62 @@ class MultiAgentRAGSystem:
             
             response = llm.invoke(synthesis_messages)
             
+            # Calculate confidence score
+            confidence = 0.0
+            
+            # Factor 1: Number and quality of tool results (0.0 - 0.35)
+            if len(tool_results) >= 3:
+                confidence += 0.35
+            elif len(tool_results) >= 2:
+                confidence += 0.25
+            elif len(tool_results) >= 1:
+                confidence += 0.15
+            
+            # Factor 2: Tool execution success (0.0 - 0.25)
+            if len(successful_tools) > 0:
+                success_rate = (len(successful_tools) - error_count) / len(successful_tools)
+                confidence += 0.25 * max(0, success_rate)
+            
+            # Factor 3: Search strategy appropriateness (0.0 - 0.15)
+            if strategy == "both":
+                confidence += 0.15  # Comprehensive search
+            elif strategy in ["pdf", "web"]:
+                confidence += 0.10  # Targeted search
+            
+            # Factor 4: Response quality indicators (0.0 - 0.20)
+            response_content = ""
+            if response.content:
+                response_content = response.content.lower()
+                if len(response.content) > 200:  # Substantial response
+                    confidence += 0.05
+                if any(indicator in response_content for indicator in ['page', 'paper:', 'according to', 'study shows']):
+                    confidence += 0.10  # Has citations/references
+                if any(indicator in response_content for indicator in ['specifically', 'precisely', 'exactly', 'found that']):
+                    confidence += 0.05  # Specific language
+            
+            # Factor 5: Query clarity bonus (0.0 - 0.05)
+            if "clarification" not in reasoning:
+                confidence += 0.05  # No clarification needed
+            
+            # Factor 6: Conversation context usage (0.0 - 0.05)
+            if conversation_context and response.content and any(phrase in response_content for phrase in ['you mentioned', 'as you said', 'your name', 'previously']):
+                confidence += 0.05  # Used conversation context effectively
+            
+            # Penalize for errors or lack of results
+            all_tool_results = newline.join(tool_results)
+            if "No tool results available" in all_tool_results:
+                confidence *= 0.1  # Severe penalty for no results
+            elif error_count > len(successful_tools) / 2:
+                confidence *= 0.5  # Penalty for many errors
+            
+            # Cap confidence between 0.0 and 1.0
+            confidence = max(0.0, min(1.0, confidence))
+            
             return {
                 **state,
-                "final_response": response.content,
-                "agent_reasoning": state.get("agent_reasoning", "") + " | Response synthesis completed"
+                "final_response": response.content or "No response generated",
+                "confidence_score": confidence,
+                "agent_reasoning": reasoning + f" | Response synthesis completed (confidence: {confidence:.2f})"
             }
         
         # Router Functions
@@ -450,7 +605,9 @@ class MultiAgentRAGSystem:
         
         def route_after_router(state: AgentState) -> str:
             strategy = state.get("search_strategy", "pdf").lower()
-            if strategy == "both":
+            if strategy == "conversational":
+                return "conversational"
+            elif strategy == "both":
                 return "pdf_research"
             elif strategy == "web":
                 return "web_research"
@@ -485,6 +642,7 @@ class MultiAgentRAGSystem:
         
         workflow.add_node("clarification", clarification_agent)
         workflow.add_node("router", router_agent)
+        workflow.add_node("conversational", conversational_agent)
         workflow.add_node("pdf_research", pdf_research_agent)
         workflow.add_node("web_research", web_research_agent)
         workflow.add_node("tool_execution", tool_execution_agent)
@@ -501,7 +659,7 @@ class MultiAgentRAGSystem:
         workflow.add_conditional_edges(
             "router",
             route_after_router,
-            {"pdf_research": "pdf_research", "web_research": "web_research"}
+            {"conversational": "conversational", "pdf_research": "pdf_research", "web_research": "web_research"}
         )
         
         workflow.add_conditional_edges(
@@ -522,6 +680,7 @@ class MultiAgentRAGSystem:
             {"web_research": "web_research", "response_synthesis": "response_synthesis"}
         )
         
+        workflow.add_edge("conversational", END)
         workflow.add_edge("response_synthesis", END)
         
         return workflow.compile()
@@ -539,8 +698,20 @@ class MultiAgentRAGSystem:
         if not session:
             return {"error": "Invalid session ID", "session_id": session_id}
         
+        # Get conversation history for context
+        session_history = session.get("messages", [])
+        
+        # Convert history to context messages for agents
+        context_messages = []
+        for i in range(0, len(session_history), 2):
+            if i + 1 < len(session_history):
+                user_msg = session_history[i]
+                assistant_msg = session_history[i + 1]
+                context_messages.append(HumanMessage(content=user_msg))
+                context_messages.append(SystemMessage(content=f"Previous response: {assistant_msg}"))
+        
         initial_state = {
-            "messages": [],
+            "messages": context_messages,  # Include conversation history
             "session_id": session_id,
             "user_query": question,
             "clarification_needed": False,

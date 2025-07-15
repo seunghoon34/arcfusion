@@ -207,13 +207,133 @@ docker-compose logs rag-api
 
 The application includes health checks and error handling. Test the API endpoints using the Swagger UI at `/docs`.
 
-## Contributing
+## Architecture Trade-offs & Future Improvements
 
-1. Ensure code follows Python best practices
-2. Add appropriate error handling
-3. Update documentation for new features
-4. Test thoroughly before submitting
+### Current Trade-offs
 
-## License
+This system was designed with several conscious trade-offs for simplicity and rapid development:
 
-This project is developed for research and educational purposes. 
+#### **1. Session Storage**
+- **Current**: In-memory session storage using Python dictionaries
+- **Trade-off**: Simple but not persistent across restarts, limited to single instance
+- **Limitation**: Sessions lost on application restart, no horizontal scaling
+
+#### **2. Confidence Scoring**
+- **Current**: Rule-based confidence calculation using predefined factors
+- **Trade-off**: Simple and interpretable but not adaptive or learning-based
+- **Limitation**: May not accurately reflect actual answer quality over time
+
+#### **3. Agent Routing**
+- **Current**: Fixed routing logic with predefined patterns and fallback to LLM
+- **Trade-off**: Predictable but not optimized for individual query types
+- **Limitation**: Cannot learn from routing successes/failures
+
+#### **4. Document Processing**
+- **Current**: Basic PDF text extraction with simple chunking
+- **Trade-off**: Fast processing but loses document structure and formatting
+- **Limitation**: Cannot process tables, images, or complex layouts effectively
+
+#### **5. Vector Storage**
+- **Current**: Local ChromaDB instance with basic embedding strategy
+- **Trade-off**: Simple setup but limited scalability and search sophistication
+- **Limitation**: No semantic clustering, limited to text similarity
+
+#### **6. Tool Architecture**
+- **Current**: Fixed set of predefined tools (PDF search, web search, paper listing)
+- **Trade-off**: Reliable but not extensible without code changes
+- **Limitation**: Cannot dynamically add new data sources or capabilities
+
+#### **7. Processing Model**
+- **Current**: Synchronous processing with sequential agent execution
+- **Trade-off**: Simple debugging but slower response times
+- **Limitation**: Cannot handle multiple queries efficiently or leverage parallelism
+
+### Future Improvement Opportunities
+
+#### **Short-term Improvements**
+
+1. **Persistent Session Storage**
+   - Implement Redis or PostgreSQL for session persistence
+   - Add session expiration and cleanup mechanisms
+   - Enable horizontal scaling across multiple instances
+
+2. **Enhanced Conversation Memory**
+   - Implement conversation summarization for long sessions
+   - Add memory compression to handle context length limits
+   - Store user preferences and interaction patterns
+
+3. **Better Error Handling**
+   - Add comprehensive retry mechanisms for API failures
+   - Implement graceful degradation when tools fail
+   - Add detailed error logging and monitoring
+
+4. **Performance Optimizations**
+   - Implement async processing for tool execution
+   - Add response caching for common queries
+   - Optimize vector search with better indexing
+
+5. **Basic Security & Scaling**
+   - Add API rate limiting and request throttling
+   - Implement basic input validation and sanitization
+   - Add health checks and readiness probes for containers
+   - Implement horizontal scaling with load balancing
+   - Add basic authentication mechanisms (API keys)
+
+#### **Medium-term Improvements**
+
+1. **Advanced Document Processing**
+   - Support for tables, images, and structured data extraction
+   - Multi-modal document understanding (OCR, layout analysis)
+   - Document relationship mapping and citation tracking
+
+2. **Intelligent Agent Routing**
+   - Machine learning-based routing decisions
+   - Performance tracking and adaptive routing
+   - User feedback integration for routing optimization
+
+3. **Enhanced Confidence Scoring**
+   - ML-based confidence prediction using query-response pairs
+   - Multi-factor confidence including source reliability
+   - Confidence calibration and continuous improvement
+
+4. **Advanced Search Capabilities**
+   - Semantic clustering and topic modeling
+   - Multi-hop reasoning across documents
+   - Temporal reasoning and trend analysis
+
+5. **Enhanced Security & Scaling**
+   - Implement OAuth 2.0 and JWT-based authentication
+   - Add encryption for data at rest and in transit
+   - Implement comprehensive input validation and prompt injection protection
+   - Add microservices architecture for better scaling
+   - Implement auto-scaling based on load metrics
+   - Add comprehensive security audit logging
+
+#### **Long-term Improvements**
+
+1. **Plugin Architecture**
+   - Extensible tool system for custom data sources
+   - Dynamic tool discovery and registration
+   - Third-party plugin ecosystem
+
+2. **Multi-modal Capabilities**
+   - Support for image, audio, and video content
+   - Cross-modal search and reasoning
+   - Visual document understanding
+
+3. **Advanced AI Features**
+   - Multi-agent collaboration and consensus
+   - Reasoning chain visualization and explanation
+   - Automated fact-checking and source verification
+
+4. **Enterprise Features**
+   - Role-based access control and user management
+   - Audit logging and compliance features
+   - Integration with enterprise systems (SSO, etc.)
+
+5. **Evaluation & Monitoring**
+   - Automated answer quality assessment
+   - A/B testing framework for system improvements
+   - Real-time performance monitoring and alerting
+
+
